@@ -1,19 +1,20 @@
 import os
 import re
 import logging
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
 import pytesseract
-from PIL import Image
-import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # ==========================================================
-# Настройка
+# Настройка логирования
 # ==========================================================
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,7 +49,7 @@ vectorizer = TfidfVectorizer()
 matrix = vectorizer.fit_transform([r["text"] for r in rules])
 
 
-def search_rules(query, top_k=3):
+def search_rules(query: str, top_k: int = 3):
     q = vectorizer.transform([query])
     sims = cosine_similarity(q, matrix)[0]
     idx = sims.argsort()[::-1][:top_k]
@@ -61,25 +62,7 @@ def search_rules(query, top_k=3):
         for i in idx
     ]
 
-def detect_doc_type(text: str) -> str:
-    """Определяет тип документа по тексту. Возвращает None, если не уверен."""
-    t = text.lower()
 
-    # Заявление на отпуск
-    if ("академическ" in t and "отпуск" in t) or "причина отпуска" in t:
-        return "Заявление на отпуск"
-
-    # Справка о практике
-    if "практик" in t and ("руководитель" in t or "сроки" in t):
-        return "Справка о практике"
-
-    # Справка об обучении
-    if "справка" in t and (
-        "обучени" in t or "период обучения" in t or "форма обучения" in t
-    ):
-        return "Справка об обучении"
-
-    return None
 # ==========================================================
 # Типы документов и их поля
 # ==========================================================
@@ -101,16 +84,54 @@ DOCUMENT_TYPES = {
 }
 
 
+def detect_doc_type(text: str):
+    """Автоопределение типа документа по тексту."""
+    t = text.lower()
+
+    if ("академическ" in t and "отпуск" in t) or "причина отпуска" in t:
+        return "Заявление на отпуск"
+
+    if "практик" in t and ("руководитель" in t or "сроки" in t):
+        return "Справка о практике"
+
+    if "справка" in t and (
+        "обучени" in t or "период обучения" in t or "форма обучения" in t
+    ):
+        return "Справка об обучении"
+
+    return None
+
+
 # ==========================================================
-# OCR через Tesseract
+# OCR с предобработкой
 # ==========================================================
 def recognize_text(image_path: str) -> str:
-    """Распознаёт текст с картинки через Tesseract."""
+    """OCR с предобработкой для плохих снимков."""
     try:
         img = Image.open(image_path)
-        # Предобработка: серый + увеличение контраста
+
+        # 1. В оттенки серого
         img = img.convert("L")
-        text = pytesseract.image_to_string(img, lang="rus+eng")
+
+        # 2. Увеличиваем в 2 раза (мелкий текст лучше читается)
+        w, h = img.size
+        img = img.resize((w * 2, h * 2), Image.LANCZOS)
+
+        # 3. Контраст
+        img = ImageEnhance.Contrast(img).enhance(1.8)
+
+        # 4. Убираем шум
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+
+        # 5. Резкость
+        img = ImageEnhance.Sharpness(img).enhance(1.5)
+
+        # 6. Бинаризация
+        img = img.point(lambda x: 0 if x < 140 else 255, "1")
+
+        # Tesseract с параметрами для документов
+        config = "--psm 6 --oem 3"
+        text = pytesseract.image_to_string(img, lang="rus+eng", config=config)
         return text
     except Exception as e:
         logger.error(f"OCR error: {e}")
@@ -192,7 +213,7 @@ def build_answer(fields: dict, question: str, best_rule: dict) -> tuple:
         return (
             "🔴 В документе и в Положении нет информации по этому вопросу. "
             "Обратитесь в деканат.",
-            "нет источника"
+            "нет источника",
         )
 
     missing = [f for f, v in fields.items() if v in ("не найдено", "нет")]
@@ -201,14 +222,14 @@ def build_answer(fields: dict, question: str, best_rule: dict) -> tuple:
         return (
             f"🟡 Не хватает: {', '.join(missing)}. "
             f"Эти поля обязательны по п. {best_rule['number']} Положения.",
-            f"п. {best_rule['number']} Положения"
+            f"п. {best_rule['number']} Положения",
         )
 
     return (
         f"🟢 Документ содержит все данные, которые требует "
         f"п. {best_rule['number']} Положения. "
         f"Окончательное решение примет сотрудник деканата.",
-        f"п. {best_rule['number']} Положения"
+        f"п. {best_rule['number']} Положения",
     )
 
 
@@ -217,6 +238,9 @@ def build_answer(fields: dict, question: str, best_rule: dict) -> tuple:
 # ==========================================================
 WAITING_PHOTO, WAITING_TYPE, WAITING_QUESTION = range(3)
 
+BUTTON_SKIP = "✅ Проверить без вопроса"
+BUTTON_AGAIN = "🔄 Проверить другой документ"
+
 
 # ==========================================================
 # Команды
@@ -224,57 +248,106 @@ WAITING_PHOTO, WAITING_TYPE, WAITING_QUESTION = range(3)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
-        "👋 Здравствуйте! Я цифровой секретарь деканата.\n\n"
-        "Пришлите фото студенческого документа (JPG или PNG)."
+        "🎓 Добро пожаловать в онлайн-деканат!\n\n"
+        "Я — цифровой секретарь. Умею читать студенческие документы "
+        "с фото и отвечать на вопросы по правилам вуза — со ссылкой "
+        "на конкретный пункт Положения.\n\n"
+        "Что я делаю:\n"
+        "📸 Читаю фото справок и заявлений\n"
+        "🔍 Сверяю с Положением\n"
+        "💬 Говорю, чего не хватает\n"
+        "🔗 Ссылаюсь на пункт правил\n\n"
+        "Пришлите фото документа — начнём."
     )
     return WAITING_PHOTO
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Как пользоваться:\n"
-        "1. Отправьте фото документа\n"
-        "2. Выберите тип\n"
-        "3. Напишите вопрос\n"
+        "❓ *Как пользоваться ботом*\n\n"
+        "1. Отправьте фото документа (JPG или PNG)\n"
+        "2. Бот сам определит тип (или попросит выбрать)\n"
+        "3. Можете написать вопрос *или нажать* "
+        "«✅ Проверить без вопроса»\n"
         "4. Получите ответ со ссылкой на Положение\n\n"
-        "Сбросить: /reset"
+        "*Команды:*\n"
+        "/start — начать работу\n"
+        "/help — эта справка\n"
+        "/reset — сбросить и начать заново\n\n"
+        "*Примеры вопросов:*\n"
+        "• Хватит ли этой справки для перевода?\n"
+        "• Всё ли в порядке с печатью?\n"
+        "• Чего не хватает в документе?",
+        parse_mode="Markdown",
     )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("Сброшено. Пришлите новое фото документа.")
+    await update.message.reply_text(
+        "🔄 Сброшено. Пришлите новое фото документа."
+    )
     return WAITING_PHOTO
 
 
 # ==========================================================
-# Приём фото
+# Приём фото + автоопределение
 # ==========================================================
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo_file = await update.message.photo[-1].get_file()
     except Exception as e:
         logger.error(f"Photo download error: {e}")
-        await update.message.reply_text("Не удалось загрузить фото. Попробуйте ещё раз.")
+        await update.message.reply_text(
+            "Не удалось загрузить фото. Попробуйте ещё раз."
+        )
         return WAITING_PHOTO
 
     path = f"/tmp/{update.message.chat_id}.jpg"
     await photo_file.download_to_drive(path)
     context.user_data["image_path"] = path
 
-    # Клавиатура с типами документов
-    keyboard = [[name] for name in DOCUMENT_TYPES.keys()]
-    await update.message.reply_text(
-        "📄 Фото получено. Выберите тип документа:",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard, resize_keyboard=True, one_time_keyboard=True
-        )
+    # Пробуем определить тип автоматически
+    await update.message.reply_text("🔍 Определяю тип документа...")
+    text = recognize_text(path)
+    auto_type = detect_doc_type(text)
+
+    # Клавиатура с кнопкой «Проверить без вопроса»
+    kb_skip = ReplyKeyboardMarkup(
+        [[KeyboardButton(BUTTON_SKIP)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
-    return WAITING_TYPE
+
+    if auto_type:
+        context.user_data["doc_type"] = auto_type
+        await update.message.reply_text(
+            f"📄 Похоже, это *{auto_type}*\n\n"
+            "Напишите ваш вопрос — или нажмите кнопку ниже, "
+            "чтобы проверить документ сразу.\n\n"
+            "Примеры вопросов:\n"
+            "• Хватит ли этой справки для перевода на 2 курс?\n"
+            "• Всё ли в порядке с печатью?\n"
+            "• Чего не хватает в документе?",
+            parse_mode="Markdown",
+            reply_markup=kb_skip,
+        )
+        return WAITING_QUESTION
+    else:
+        # Не удалось определить — просим выбрать тип вручную
+        keyboard = [[name] for name in DOCUMENT_TYPES.keys()]
+        await update.message.reply_text(
+            "📄 Фото получено. Не смог определить тип автоматически.\n"
+            "Выберите тип документа:",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard, resize_keyboard=True, one_time_keyboard=True
+            ),
+        )
+        return WAITING_TYPE
 
 
 # ==========================================================
-# Выбор типа
+# Выбор типа вручную
 # ==========================================================
 async def handle_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc_type = update.message.text
@@ -285,9 +358,22 @@ async def handle_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_TYPE
 
     context.user_data["doc_type"] = doc_type
+
+    kb_skip = ReplyKeyboardMarkup(
+        [[KeyboardButton(BUTTON_SKIP)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
     await update.message.reply_text(
-        f"Тип: *{doc_type}*\n\nТеперь напишите ваш вопрос:",
-        parse_mode="Markdown"
+        f"Тип: *{doc_type}*\n\n"
+        "Напишите ваш вопрос — или нажмите кнопку ниже, "
+        "чтобы проверить документ сразу.\n\n"
+        "Примеры вопросов:\n"
+        "• Хватит ли этой справки для перевода на 2 курс?\n"
+        "• Всё ли в порядке с печатью?\n"
+        "• Чего не хватает в документе?",
+        parse_mode="Markdown",
+        reply_markup=kb_skip,
     )
     return WAITING_QUESTION
 
@@ -296,7 +382,16 @@ async def handle_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Приём вопроса и ответ
 # ==========================================================
 async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = update.message.text
+    text_input = update.message.text
+
+    # Проверяем: пользователь нажал «Проверить без вопроса» или написал вопрос
+    if text_input == BUTTON_SKIP:
+        question = "Всё ли в порядке с этим документом? Чего не хватает?"
+        user_asked = False
+    else:
+        question = text_input
+        user_asked = True
+
     image_path = context.user_data.get("image_path")
     doc_type = context.user_data.get("doc_type")
 
@@ -317,18 +412,34 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_PHOTO
 
-    # Извлечение полей
+    # Поля
     fields = extract_fields(text, doc_type)
 
     # Поиск по Положению
     query = question + " " + " ".join(str(v) for v in fields.values())
-    candidates = search_rules(query, top_k=1)
+    candidates = search_rules(query, top_k=3)
     best = candidates[0] if candidates else None
 
     # Ответ
     answer_text, source = build_answer(fields, question, best)
 
-    fields_str = "\n".join([f"• {k}: {v}" for k, v in fields.items()])
+    # Красивое разделение полей
+    found = [
+        f"✅ {k}: {v}"
+        for k, v in fields.items()
+        if v not in ("не найдено", "нет")
+    ]
+    missing = [
+        f"❌ {k}: не найдено"
+        for k, v in fields.items()
+        if v in ("не найдено", "нет")
+    ]
+
+    fields_str = ""
+    if found:
+        fields_str += "*Найдено:*\n" + "\n".join(found)
+    if missing:
+        fields_str += "\n\n*Не найдено:*\n" + "\n".join(missing)
 
     response = (
         f"📋 *Карточка полей:*\n{fields_str}\n\n"
@@ -342,8 +453,27 @@ async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Send error: {e}")
         await update.message.reply_text(response)
 
+    # Кнопка для следующего документа
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton(BUTTON_AGAIN)]],
+        resize_keyboard=True,
+    )
     await update.message.reply_text(
-        "Пришлите следующее фото или /start для нового диалога."
+        "Можете прислать следующий документ или нажать кнопку ниже.",
+        reply_markup=kb,
+    )
+    return WAITING_PHOTO
+
+
+# ==========================================================
+# Текст без фото (бот не должен «виснуть»)
+# ==========================================================
+async def handle_text_without_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    await update.message.reply_text(
+        "📄 Чтобы я мог проверить документ, сначала пришлите его фото.\n\n"
+        "Отправьте фото справки, заявления или справки о практике."
     )
     return WAITING_PHOTO
 
@@ -358,10 +488,15 @@ def main():
         entry_points=[
             CommandHandler("start", start),
             MessageHandler(filters.PHOTO, handle_photo),
+            MessageHandler(filters.Regex(f"^{BUTTON_AGAIN}$"), reset),
         ],
         states={
             WAITING_PHOTO: [
                 MessageHandler(filters.PHOTO, handle_photo),
+                MessageHandler(filters.Regex(f"^{BUTTON_AGAIN}$"), reset),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, handle_text_without_photo
+                ),
             ],
             WAITING_TYPE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_type),
@@ -373,6 +508,7 @@ def main():
         fallbacks=[
             CommandHandler("reset", reset),
             CommandHandler("help", help_command),
+            CommandHandler("start", start),
         ],
     )
 
